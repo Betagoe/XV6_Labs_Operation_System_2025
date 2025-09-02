@@ -289,6 +289,9 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  //将proc_trace_mask拷贝到子进程
+  np->proc_trace_mask = p->proc_trace_mask;
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -691,5 +694,17 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
+  }
+}
+
+// 获取进程数
+void
+proc_cnt(uint64 *ptr) {
+  *ptr = 0;
+  // 遍历进程表
+  for(struct proc *p = proc; p < &proc[NPROC]; p++) {
+    // 只要进程状态不是UNUSED，就计数
+    if(p->state != UNUSED) 
+      (*ptr)++;
   }
 }

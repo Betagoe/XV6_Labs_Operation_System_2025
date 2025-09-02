@@ -36,3 +36,6 @@ entry("getpid");
 entry("sbrk");
 entry("sleep");
 entry("uptime");
+# 添加trace和sysinfo
+entry("trace");
+entry("sysinfo");
