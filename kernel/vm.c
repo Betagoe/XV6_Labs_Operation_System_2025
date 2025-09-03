@@ -5,6 +5,11 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
+
+int copyinstr_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max);
+int copyin_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len);
 
 /*
  * the kernel's page table.
@@ -379,23 +384,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,38 +394,182 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+   return copyinstr_new(pagetable, dst, srcva, max);
+}
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
+// 仿照freewalk写一个递归函数,level用于打印时行首的缩进，表末尾的判断使用PTE_R等
+void
+vmprintIn(pagetable_t pagetable, int level){
+  // 页表大小为 2^9 = 512
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    // PTE_V是页表项有效的标志
+    if(pte & PTE_V){
+        // 打印行首的缩进
+      for (int j = 0; j < level; j++){
+        if (j) printf(" ");
+        printf("..");
       }
-      --n;
-      --max;
-      p++;
-      dst++;
+      // PTE2PA宏取出页表项中的物理地址
+      uint64 pa = PTE2PA(pte);
+      printf("%d: pte %p pa %p\n", i, pte, pa);
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        // 上一级的页表的物理地址将被映射到当下一级的页表项
+        vmprintIn((pagetable_t)pa, level + 1);
+      }
     }
-
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
   }
 }
+
+// 打印页表信息
+void
+vmprint(pagetable_t pagetable){
+  printf("page table %p\n", pagetable);
+// 调用上边的递归函数，深度为1
+  vmprintIn(pagetable, 1);
+}
+
+// 进程内核页映射函数
+void
+prockvmmap(pagetable_t procpagetable, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if(mappages(procpagetable, va, sz, pa, perm) != 0)
+    panic("prockvmmap");
+}
+
+pagetable_t
+prockvminit()
+{
+  pagetable_t procpagetable = (pagetable_t) kalloc();
+  if (procpagetable == 0) {
+    return procpagetable;
+  }
+  memset(procpagetable, 0, PGSIZE);
+  // 固定的常数映射不变，直接照搬过来
+  // uart registers
+  prockvmmap(procpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  // virtio mmio disk interface
+  prockvmmap(procpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  // CLINT
+  prockvmmap(procpagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  // PLIC
+  prockvmmap(procpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  // map kernel text executable and read-only.
+  prockvmmap(procpagetable, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+  // map kernel data and the physical RAM we'll make use of.
+  prockvmmap(procpagetable, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  prockvmmap(procpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  return procpagetable;
+}
+
+
+// 释放进程的内核页表,但是不释放物理内存
+void
+procfreewalk(pagetable_t pagetable)
+{
+  // 页表大小为 2^9 = 512
+  for(int i = 0; i < 512; ++i){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // 这里模仿freewalk的写法, 递归释放下级页表
+      uint64 child = PTE2PA(pte);
+      procfreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+    pagetable[i] = 0;
+  }
+  kfree((void*)pagetable);
+}
+
+// 解除进程内核页表的映射,但是不释放物理内存
+void
+prockvmunmap(pagetable_t pagetable, uint64 va, uint64 npages)
+{
+  pte_t *pte;
+
+  // 判断地址是否页对齐
+  if((va % PGSIZE) != 0)
+    panic("prockvmunmap: not aligned");
+
+  for(uint64 proca = va; proca < va + npages*PGSIZE; proca += PGSIZE){
+    // 这里不需要释放物理内存, 所以walk的alloc参数为0
+    if((pte = walk(pagetable, proca, 0)) == 0){
+      *pte = 0;
+      continue;
+    }
+    // 如果页表项无效, 说明映射已经解除
+    if((*pte & PTE_V) == 0){
+      *pte = 0;
+      continue;
+    }
+    // 如果是叶子节点, 说明映射已经解除
+    if(PTE_FLAGS(*pte) == PTE_V){
+      panic("prockvmunmap: not a leaf");
+    }
+  }
+}
+
+// 释放进程的内核页表,但是不释放物理内存
+void freeprockvm(struct proc* p) {
+  pagetable_t procpagetable = p->procpagetable;
+  // 按分配顺序的逆序来销毁映射
+  prockvmunmap(procpagetable, p->kstack, PGSIZE/PGSIZE);
+  prockvmunmap(procpagetable, TRAMPOLINE, PGSIZE/PGSIZE);
+  prockvmunmap(procpagetable, (uint64)etext, (PHYSTOP-(uint64)etext)/PGSIZE);
+  prockvmunmap(procpagetable, KERNBASE, ((uint64)etext-KERNBASE)/PGSIZE);
+  prockvmunmap(procpagetable, PLIC, 0x400000/PGSIZE);
+  prockvmunmap(procpagetable, CLINT, 0x10000/PGSIZE);
+  prockvmunmap(procpagetable, VIRTIO0, PGSIZE/PGSIZE);
+  prockvmunmap(procpagetable, UART0, PGSIZE/PGSIZE);
+  procfreewalk(procpagetable);
+}
+
+// 取消掉remap的panic
+int
+procmappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  uint64 a, last;
+  pte_t *pte;
+
+  a = PGROUNDDOWN(va);
+  last = PGROUNDDOWN(va + size - 1);
+  for(;;){
+    if((pte = walk(pagetable, a, 1)) == 0)
+      return -1;
+    *pte = PA2PTE(pa) | perm | PTE_V;
+    if(a == last)
+      break;
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return 0;
+}
+
+
+// 将从begin到end的虚拟地址的映射, 从oldpage复制到newpage
+int
+pagecopy(pagetable_t oldpage, pagetable_t newpage, uint64 begin, uint64 end) {
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  begin = PGROUNDUP(begin);
+
+  for (uint64 i = begin; i < end; i += PGSIZE) {
+    // 获取旧页表中的页表项
+    if ((pte = walk(oldpage, i, 0)) == 0)
+      panic("pagecopy walk oldpage nullptr");
+    if ((*pte & PTE_V) == 0)
+      panic("pagecopy oldpage pte not valid");
+    // 获取物理地址
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte) & (~PTE_U); 
+    if (procmappages(newpage, i, PGSIZE, pa, flags) != 0) {
+      uvmunmap(newpage, 0, i / PGSIZE, 1);
+      return -1;
+    }
+  }
+  return 0;
+}
+
