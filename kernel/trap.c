@@ -14,6 +14,9 @@ extern char trampoline[], uservec[], userret[];
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
 
+// Copy-On-Write (COW) write handler
+int cow_write(pagetable_t pagetable, uint64 pv);
+
 extern int devintr();
 
 void
@@ -65,7 +68,13 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } else if (r_scause() == 15) {
+    // COW操作
+    if (cow_write(p->pagetable, r_stval()) < 0) {
+      p->killed = 1;
+    }
+  }
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);

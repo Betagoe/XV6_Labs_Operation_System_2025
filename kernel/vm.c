@@ -15,6 +15,8 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+void add_ref(uint64 pa, int num); // kalloc.c
+
 /*
  * create a direct-map page table for the kernel.
  */
@@ -311,7 +313,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -319,20 +320,46 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    // 父进程的该页只读,不论父子进程都将其设为只读
+    *pte &= ~PTE_W; 
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
       goto err;
     }
+    add_ref(pa, 1); // 增加该物理页的引用计数
   }
   return 0;
 
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
+}
+
+// 完成写操作后对页面的复制
+int
+cow_write(pagetable_t pagetable, uint64 pv){
+  pte_t *pte = walk(pagetable, pv, 0);
+  if (pte == 0) {
+    panic("cowalloc: pa not exists");
+  }
+  if ((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) {
+    panic("cowalloc: pte permission err");
+  }
+  // 开始复制
+  uint64 pa_new = (uint64)kalloc();
+  if (pa_new == 0) {
+    printf("cowalloc: kalloc fails\n");
+    return -1;
+  }
+  uint64 pa_old = PTE2PA(*pte);
+  memmove((void *)pa_new, (const void *)pa_old, PGSIZE);
+  kfree((void *)pa_old); // 减少COW页面的reference count
+  // 更新PTE
+  *pte = PA2PTE(pa_new) | PTE_FLAGS(*pte) | PTE_W;
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -358,6 +385,20 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if (va0 >= MAXVA)
+      return -1;
+    pte_t *pte = walk(pagetable, va0, 0);
+    if (pte == 0 || (*pte & PTE_U) == 0 || (*pte & PTE_V) == 0) {
+      printf("copyout: invalid pte\n");
+      return -1;
+    }
+    // 写的目的地是COW共享页, 需要复制一份
+    if ((*pte & PTE_W) == 0) {
+      if (cow_write(pagetable, va0) < 0) {
+        return -1;
+      }
+    }
+    
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
