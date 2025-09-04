@@ -97,6 +97,14 @@ struct proc {
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack
   uint64 sz;                   // Size of process memory (bytes)
+
+  // 用于管理alarm的变量
+  int alarm_tick;             // alarm的触发间隔
+  int alarm_interval;         // 记录距离上次触发alarm的时间
+  void (*alarm_handler)();    // alarm的中断处理函数
+  int isalarm;               // 记录当前是否处于alarm处理函数中
+  struct trapframe *alarmframe; // 用于保存现场
+
   pagetable_t pagetable;       // User page table
   struct trapframe *trapframe; // data page for trampoline.S
   struct context context;      // swtch() here to run process

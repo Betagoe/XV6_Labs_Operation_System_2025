@@ -77,9 +77,22 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if(which_dev == 2){
+    // 给当前进程的运行时间加1
+    p->alarm_interval++;
+    // 如果达到了触发alarm的间隔时间，并且alarm_handler不为空
+    if (p->isalarm == 0 && p->alarm_tick > 0 && p->alarm_interval >= p->alarm_tick) {
+      // 记录当前处于alarm处理函数中
+      p->isalarm = 1;
+      // 保存现场
+      *(p->alarmframe) = *(p->trapframe);
+      // 跳转到终端处理函数
+      p->trapframe->epc = (uint64)(p->alarm_handler);
+      // 重置alarm_interval
+      p->alarm_interval = 0;
+    }
     yield();
-
+  }
   usertrapret();
 }
 

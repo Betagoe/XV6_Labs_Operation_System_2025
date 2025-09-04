@@ -132,3 +132,20 @@ printfinit(void)
   initlock(&pr.lock, "pr");
   pr.locking = 1;
 }
+
+// 打印当前函数调用栈的所有返回地址
+void backtrace(void)
+{
+  printf("backtrace:\n");
+  uint64 curr_ptr = r_fp();
+  uint64 page_bottom = PGROUNDDOWN(curr_ptr);
+  // 调用栈是一个链表结构
+  while (page_bottom < curr_ptr) {
+    // 返回地址保存在-8偏移的位置
+    uint64 ret = *(pte_t *)(curr_ptr - 0x8);
+    // 上一个栈帧的栈底保存在-16偏移的位置,注意是0x10不是0x16
+    uint64 prev_ptr = *(pte_t *)(curr_ptr - 0x10);
+    curr_ptr = prev_ptr;
+    printf("%p\n", ret);
+  }
+}

@@ -70,6 +70,8 @@ sys_sleep(void)
     sleep(&ticks, &tickslock);
   }
   release(&tickslock);
+  //加入对backtrace的调用
+  backtrace();
   return 0;
 }
 
@@ -94,4 +96,35 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+// 用于开始alarm的系统调用
+uint64
+sys_sigalarm(void) {
+  // 获取到当前进程
+  struct proc *my_proc = myproc();
+  // 从用户态获取参数
+  int tick;
+  if (argint(0, &tick) < 0)
+    return -1;
+  uint64 func;
+  if(argaddr(1, &func) < 0)
+    return -1;
+  // 初始化alarm相关变量
+  my_proc->alarm_tick = tick;
+  my_proc->alarm_handler = (void (*)()) func;
+  my_proc->alarm_interval = 0;
+  return 0;
+}
+
+// 用于结束alarm的系统调用
+uint64
+sys_sigreturn(void) {
+  struct proc* p = myproc();
+  if (p->isalarm) {
+    // 结束调用，返回现场
+    p->isalarm = 0;
+    *p->trapframe = *p->alarmframe;
+  }
+  return 0;
 }
