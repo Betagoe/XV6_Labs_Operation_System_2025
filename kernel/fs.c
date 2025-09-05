@@ -375,11 +375,11 @@ iunlockput(struct inode *ip)
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
 static uint
-bmap(struct inode *ip, uint bn)
-{
-  uint addr, *a;
-  struct buf *bp;
+bmap(struct inode *ip, uint bn){
+  uint addr, *a, *b;
+  struct buf *nbp, *dbp;
 
+  // 直接映射层保持不变
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0)
       ip->addrs[bn] = addr = balloc(ip->dev);
@@ -387,17 +387,43 @@ bmap(struct inode *ip, uint bn)
   }
   bn -= NDIRECT;
 
+  // 一级映射层也保持不变
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0)
       ip->addrs[NDIRECT] = addr = balloc(ip->dev);
-    bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
+    nbp = bread(ip->dev, addr);
+    a = (uint*)nbp->data;
     if((addr = a[bn]) == 0){
       a[bn] = addr = balloc(ip->dev);
-      log_write(bp);
+      log_write(nbp);
     }
-    brelse(bp);
+    brelse(nbp);
+    return addr;
+  }
+  bn -= NINDIRECT;
+
+  // 二级映射层
+  if (bn < DINDIRECT) {
+    // 加载一级间接中间块，必要时分配
+    if((addr = ip->addrs[NDIRECT+1]) == 0)
+      ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
+    nbp = bread(ip->dev, addr);
+    a = (uint*)nbp->data;
+    // 加载二级间接块，必要时分配
+    if((addr = a[bn / NINDIRECT]) == 0) {
+      a[bn / NINDIRECT] = addr = balloc(ip->dev);
+      log_write(nbp);
+    }
+    brelse(nbp);
+    dbp = bread(ip->dev, addr);
+    b = (uint*)dbp->data;
+    // 加载数据块，必要时分配
+    if((addr = b[bn % NINDIRECT]) == 0) {
+      b[bn % NINDIRECT] = addr = balloc(ip->dev);
+      log_write(dbp);
+    }
+    brelse(dbp);
     return addr;
   }
 
@@ -407,11 +433,10 @@ bmap(struct inode *ip, uint bn)
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
 void
-itrunc(struct inode *ip)
-{
-  int i, j;
-  struct buf *bp;
-  uint *a;
+itrunc(struct inode *ip){
+  int i, j, k;
+  struct buf *nbp, *dbp;
+  uint *a, *b;
 
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
@@ -421,15 +446,37 @@ itrunc(struct inode *ip)
   }
 
   if(ip->addrs[NDIRECT]){
-    bp = bread(ip->dev, ip->addrs[NDIRECT]);
-    a = (uint*)bp->data;
+    nbp = bread(ip->dev, ip->addrs[NDIRECT]);
+    a = (uint*)nbp->data;
     for(j = 0; j < NINDIRECT; j++){
       if(a[j])
         bfree(ip->dev, a[j]);
     }
-    brelse(bp);
+    brelse(nbp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  // 释放二级间接块
+  if(ip->addrs[NDIRECT+1]){
+    nbp = bread(ip->dev, ip->addrs[NDIRECT+1]);
+    a = (uint*)nbp->data;
+    for(j = 0; j < NINDIRECT; j++){
+      if(a[j]){
+        // 释放二级间接块中的数据块
+        dbp = bread(ip->dev, a[j]);
+        b = (uint*)dbp->data;
+        for(k = 0; k < NINDIRECT; k++){
+          if(b[k])
+            bfree(ip->dev, b[k]);
+        }
+        brelse(dbp);
+        bfree(ip->dev, a[j]);
+      }
+    }
+    brelse(nbp);
+    bfree(ip->dev, ip->addrs[NDIRECT+1]);
+    ip->addrs[NDIRECT+1] = 0;
   }
 
   ip->size = 0;

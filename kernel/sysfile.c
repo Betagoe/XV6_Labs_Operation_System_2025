@@ -316,6 +316,36 @@ sys_open(void)
     }
   }
 
+  // 开始处理符号链接
+  int depth = 0;
+  while (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
+    // 清空path
+    for (int i = 0; i < n; i++) {
+      path[i] = 0;
+    }
+    // 从软链接的inode的[0, MAXPATH]读出它所对应的target path
+    if ((readi(ip, 0, (uint64)path, 0, ip->size)) != ip->size) {
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+    iunlockput(ip);
+    // 路径不存在
+    if((ip = namei(path)) == 0){
+      end_op();
+      return -1;
+    }
+
+    ilock(ip);
+    depth++;
+    if (depth > 10) {
+      // 深度不得大于10
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+  }
+
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
@@ -482,5 +512,45 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+// 用于创建符号链接
+int sys_symlink(void) {
+  char path[MAXPATH], target[MAXPATH];
+  // 初始化路径和目标路径缓冲区
+  for (int i = 0; i < MAXPATH; i++) {
+    path[i] = 0;
+    target[i] = 0;
+  }
+  
+  struct inode *ip;
+  int n, r;
+
+  // 获取用户传递的路径字符串和目标路径字符串
+  if((n = argstr(0, target, MAXPATH)) < 0)
+    return -1;
+  if ((n = argstr(1, path, MAXPATH)) < 0)
+    return -1;
+
+  begin_op();
+  // 路径已存在
+  if((ip = namei(path)) != 0){
+    end_op();
+    return -1;
+  }
+  // 创建符号链接文件
+  ip = create(path, T_SYMLINK, 0, 0);
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+  // 将目标路径写入符号链接文件
+  if ((r = writei(ip, 0, (uint64)target, 0, MAXPATH)) < 0){
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
   return 0;
 }
