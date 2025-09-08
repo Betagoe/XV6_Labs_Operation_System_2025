@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -97,8 +98,7 @@ allocpid() {
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
 static struct proc*
-allocproc(void)
-{
+allocproc(void){
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++) {
@@ -112,6 +112,12 @@ allocproc(void)
   return 0;
 
 found:
+  // 初始化vma
+  for (int i = 0; i < NVMA; i++) { 
+    p->vma[i].valid = 0;
+  }
+
+
   p->pid = allocpid();
 
   // Allocate a trapframe page.
@@ -298,6 +304,15 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  for (int i = 0; i < NVMA; i++) {
+    np->vma[i].valid = 0;
+    // 复制vma entry 并增加文件引用计数
+    if (p->vma[i].valid) { 
+      memmove(&np->vma[i], &p->vma[i], sizeof(struct vma));
+      filedup(p->vma[i].f); 
+    }
+  }
+
   pid = np->pid;
 
   np->state = RUNNABLE;
@@ -350,6 +365,20 @@ exit(int status)
       struct file *f = p->ofile[fd];
       fileclose(f);
       p->ofile[fd] = 0;
+    }
+  }
+
+  // 释放vma相关
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].valid) {
+      // 如果是 MAP_SHARED 则写回文件
+      if (p->vma[i].flags & MAP_SHARED) {
+        filewrite(p->vma[i].f, p->vma[i].addr, p->vma[i].length);
+      }
+      fileclose(p->vma[i].f);
+      // 删除页表映射
+      uvmunmap(p->pagetable, p->vma[i].addr, p->vma[i].length / PGSIZE, 1);
+      p->vma[i].valid = 0;
     }
   }
 

@@ -484,3 +484,98 @@ sys_pipe(void)
   }
   return 0;
 }
+
+uint64
+sys_mmap(void) {
+  uint64 addr;
+  int length, prot, flags, fd, offset;
+  struct file* f;
+  // 获得进程
+  struct proc* p = myproc();
+  // 获取参数
+  if (argaddr(0, &addr) < 0 || argint(1, &length) < 0 || argint(2, &prot) < 0 ||
+      argint(3, &flags) < 0 || argfd(4, &fd, &f) < 0 || argint(5, &offset) < 0)
+    return -1;
+    
+  // 参数检查
+  length = PGROUNDUP(length);
+  if (MAXVA - length < p->sz)
+    return -1;
+  if (!f->readable && (prot & PROT_READ))
+    return -1;
+  if (!f->writable && (prot & PROT_WRITE) && (flags == MAP_SHARED))
+    return -1;
+  // 检测地址，这里只做了地址为0的逻辑
+  if (addr != 0){
+    panic("mmap: only addr == 0 is supported");
+  }
+  // 查找空闲vma
+  for (int i = 0; i < NVMA; i++) {
+    struct vma* vma = &p->vma[i];
+    if (vma->valid == 0) {
+      // 分配vma
+      vma->valid = 1;
+      // mmap 不应分配物理内存或读取文件
+      vma->addr = addr = p->sz;
+      // 更新进程大小
+      p->sz += length;
+      vma->length = length;
+      vma->prot = prot;
+      vma->flags = flags;
+      vma->offset = offset;
+      vma->fd = fd;
+      vma->f = f;
+      // 增加文件引用
+      filedup(f);
+      return vma->addr;
+    }
+  }
+  // 没有空闲vma
+  printf("mmap: no free vma\n");
+  return -1;
+}
+
+uint64
+sys_munmap(void) {
+  uint64 addr;
+  int length;
+  // 获得进程和参数
+  struct proc* p = myproc();
+  if (argaddr(0, &addr) < 0 || argint(1, &length) < 0)
+    return -1;
+  // 在vma中查找
+  for (int i = 0; i < NVMA; i++) {
+    struct vma* vma = &p->vma[i];
+    if (vma->valid && addr >= vma->addr && addr <= vma->addr + vma->length) {
+      // write back 将区域复写回文件
+      addr = PGROUNDDOWN(addr);
+      length = PGROUNDUP(length);
+      if  (vma -> flags & MAP_SHARED) {
+        filewrite(vma->f, addr, length);
+      }
+      // 删除页表映射
+      uvmunmap(p->pagetable, addr, length / PGSIZE, 1);
+      // 更新进程大小
+      if (addr == vma->addr && length == vma->length){
+        // 如果是整个vma则删除
+        fileclose(vma->f);
+        vma->valid = 0;
+      }else if (addr == vma->addr) {
+        // 如果是vma开头则更新
+        vma->addr += length;
+        vma->length -= length;
+        vma->offset += length;
+      } else if (addr + length == vma->addr + vma->length) {
+        // 如果是vma结尾则更新
+        vma->length -= length;
+      } else {
+        // 否则不支持
+        panic("munmap: cannot unmap middle of vma\n");
+      }
+      return 0;
+    }
+  }
+  // 未找到对应的vma
+  panic("munmap: vma not found\n");
+  return -1;
+}

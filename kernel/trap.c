@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fcntl.h"
+#include "fs.h"
+#include "file.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -34,8 +38,7 @@ trapinithart(void)
 // called from trampoline.S
 //
 void
-usertrap(void)
-{
+usertrap(void){
   int which_dev = 0;
 
   if((r_sstatus() & SSTATUS_SPP) != 0)
@@ -65,7 +68,55 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } 
+  // 读或者写导致了缺页中断
+  else if(r_scause() == 13 || r_scause() == 15){
+    // 读取导致缺页中断的地址
+    uint64 va = r_stval(); 
+    // 防止地址越界
+    if (va > MAXVA || va > p->sz) {
+      p->killed = 1;
+    }
+    uint flags;
+    int found = 0;
+    // 在vma中查找
+    for (int i = 0; i < NVMA; i++) {
+      struct vma* vma = &p->vma[i];
+      if (vma->valid && va >= vma->addr && va < vma->addr + vma->length) {
+        // 为 mmap 分配物理内存
+        va = PGROUNDDOWN(va);
+        uint64 pa = (uint64)kalloc();
+        if (pa == 0) {
+          break;
+        }
+        memset((void*)pa, 0, PGSIZE);
+        // 如果是 MAP_PRIVATE 并且是读写缺页，则从文件中读取数据
+        ilock(vma->f->ip);
+        if (readi(vma->f->ip, 0, pa, vma->offset + (va - vma->addr), PGSIZE) < 0) {
+          iunlock(vma->f->ip);
+          break;
+        }
+        iunlock(vma->f->ip);
+        // 映射到进程页表
+        flags = PTE_U;
+        if (vma->prot & PROT_READ) flags |= PTE_R;
+        if (vma->prot & PROT_WRITE) flags |= PTE_W;
+        if (vma->prot & PROT_EXEC) flags |= PTE_X;
+        if (mappages(p->pagetable, va, PGSIZE, pa, flags) != 0) {
+          kfree((void*)pa);
+          break;
+        }
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      // 未找到对应的vma，终止进程
+      p->killed = 1;
+    }
+
+  }
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
